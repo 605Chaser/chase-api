@@ -3,7 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import math
 import asyncio
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timezone, timedelta
 
 app = FastAPI()
 
@@ -14,8 +15,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-import os
 SYNOPTIC_TOKEN = os.environ.get("SYNOPTIC_TOKEN", "")
+
+# Simple in-memory cache — keyed by rounded lat/lon, expires after 30 min
+_cache = {}
+CACHE_TTL = timedelta(minutes=30)
+
+def cache_key(lat, lon):
+    return f"{round(lat,2)},{round(lon,2)}"
+
+def cache_get(key):
+    entry = _cache.get(key)
+    if entry and datetime.now(timezone.utc) - entry["ts"] < CACHE_TTL:
+        return entry["data"]
+    return None
+
+def cache_set(key, data):
+    _cache[key] = {"ts": datetime.now(timezone.utc), "data": data}
 
 def wind_uv(spd, direction):
     r = math.radians(direction)
@@ -55,37 +71,25 @@ def calc_convergence(stations, lat, lon):
     return -(dudx / n + dvdy / n) * 1000 if n > 0 else None
 
 async def fetch_hrrr(lat, lon):
-    """Fetch HRRR data via NOMADS for a specific lat/lon point"""
+    # Single API call — combine all fields into one request to minimize quota usage
+    url = (
+        f"https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        f"&hourly=temperature_2m,dewpoint_2m,cape,cin,"
+        f"windspeed_10m,winddirection_10m,"
+        f"windspeed_80m,winddirection_80m,"
+        f"windspeed_180m,winddirection_180m"
+        f"&wind_speed_unit=kn&temperature_unit=celsius&forecast_days=1&timezone=auto"
+    )
     async with httpx.AsyncClient(timeout=30) as client:
-        # Surface + thermodynamic fields from Open-Meteo (reliable surface data)
-        sfc_url = (
-            f"https://api.open-meteo.com/v1/forecast"
-            f"?latitude={lat}&longitude={lon}"
-            f"&hourly=temperature_2m,dewpoint_2m,cape,cin,windspeed_10m,winddirection_10m"
-            f"&wind_speed_unit=kn&temperature_unit=celsius&forecast_days=1&timezone=auto"
-        )
-        # Pressure level winds - separate call
-        upper_url = (
-            f"https://api.open-meteo.com/v1/forecast"
-            f"?latitude={lat}&longitude={lon}"
-            f"&hourly=windspeed_850hPa,winddirection_850hPa,windspeed_500hPa,winddirection_500hPa"
-            f"&wind_speed_unit=kn&forecast_days=1&timezone=auto"
-        )
-        r1, r2 = await asyncio.gather(client.get(sfc_url), client.get(upper_url))
-        if r1.status_code != 200:
-            raise HTTPException(500, f"Surface API error: {r1.text[:200]}")
-        if r2.status_code != 200:
-            raise HTTPException(500, f"Upper API error: {r2.text[:200]}")
-        d1, d2 = r1.json(), r2.json()
-        d1["hourly"].update({
-            "windspeed_850hPa": d2["hourly"].get("windspeed_850hPa", []),
-            "winddirection_850hPa": d2["hourly"].get("winddirection_850hPa", []),
-            "windspeed_500hPa": d2["hourly"].get("windspeed_500hPa", []),
-            "winddirection_500hPa": d2["hourly"].get("winddirection_500hPa", []),
-        })
-        return d1
+        r = await client.get(url)
+        if r.status_code != 200:
+            raise HTTPException(500, f"Surface API error: {r.text[:200]}")
+        return r.json()
 
 async def fetch_synoptic(lat, lon):
+    if not SYNOPTIC_TOKEN:
+        return []
     url = (
         f"https://api.synopticdata.com/v2/stations/nearesttime"
         f"?token={SYNOPTIC_TOKEN}&within=60&radius={lat},{lon}"
@@ -127,27 +131,32 @@ def get_current_hour_idx(hourly_times):
 
 @app.get("/score")
 async def score(lat: float, lon: float):
+    key = cache_key(lat, lon)
+    cached = cache_get(key)
+    if cached:
+        cached["cached"] = True
+        return cached
+
     wx, syn = await asyncio.gather(fetch_hrrr(lat, lon), fetch_synoptic(lat, lon))
 
     h = wx["hourly"]
     idx = get_current_hour_idx(h["time"])
 
-    temp_c = (h["temperature_2m"] or [0])[idx] or 0
-    dew_c  = (h["dewpoint_2m"]    or [0])[idx] or 0
-    cape   = (h["cape"]           or [0])[idx] or 0
-    cin    = (h["cin"]            or [0])[idx] or 0
-    spd10  = (h["windspeed_10m"]  or [0])[idx] or 0
-    dir10  = (h["winddirection_10m"] or [0])[idx] or 0
-    spd850 = (h["windspeed_850hPa"]  or [0])[idx] or 0
-    dir850 = (h["winddirection_850hPa"] or [0])[idx] or 0
-    spd500 = (h["windspeed_500hPa"]  or [0])[idx] or 0
-    dir500 = (h["winddirection_500hPa"] or [0])[idx] or 0
+    temp_c = (h.get("temperature_2m") or [0])[idx] or 0
+    dew_c  = (h.get("dewpoint_2m")    or [0])[idx] or 0
+    cape   = (h.get("cape")           or [0])[idx] or 0
+    cin    = (h.get("cin")            or [0])[idx] or 0
+    spd10  = (h.get("windspeed_10m")  or [0])[idx] or 0
+    dir10  = (h.get("winddirection_10m") or [0])[idx] or 0
+    spd80  = (h.get("windspeed_80m")  or [0])[idx] or 0
+    dir80  = (h.get("winddirection_80m") or [0])[idx] or 0
+    spd180 = (h.get("windspeed_180m") or [0])[idx] or 0
+    dir180 = (h.get("winddirection_180m") or [0])[idx] or 0
 
     lcl   = calc_lcl(temp_c, dew_c)
-    shear = calc_shear(spd10, dir10, spd500, dir500)
-    srh   = calc_srh(spd10, dir10, spd850, dir850)
+    shear = calc_shear(spd10, dir10, spd180, dir180)
+    srh   = calc_srh(spd10, dir10, spd80, dir80)
 
-    dew_f = dew_c * 9/5 + 32
     conv_val = None
     conv_src = "estimated"
     sta_dew  = None
@@ -167,20 +176,23 @@ async def score(lat: float, lon: float):
     final_dew_c = sta_dew if sta_dew is not None else dew_c
     final_dew_f = final_dew_c * 9/5 + 32
 
-    return {
+    result = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "cached": False,
         "params": {
-            "cape":       {"value": round(cape),        "unit": "J/kg",   "src": "hrrr"},
-            "cin":        {"value": round(cin),         "unit": "J/kg",   "src": "hrrr"},
-            "lcl":        {"value": round(lcl),         "unit": "m",      "src": "hrrr"},
-            "shear_06km": {"value": round(shear, 1),   "unit": "kts",    "src": "hrrr"},
-            "srh_01km":   {"value": round(srh, 1),     "unit": "m2/s2",  "src": "hrrr"},
-            "dewpoint":   {"value": round(final_dew_f, 1), "unit": "°F", "src": "synoptic" if sta_dew else "hrrr"},
-            "convergence":{"value": round(conv_val, 2),"unit": "",       "src": conv_src},
-            "boundary":   {"value": "likely" if cape > 300 and cin > -150 else "unlikely", "unit": "", "src": "hrrr"},
+            "cape":       {"value": round(cape),           "unit": "J/kg",   "src": "live"},
+            "cin":        {"value": round(cin),            "unit": "J/kg",   "src": "live"},
+            "lcl":        {"value": round(lcl),            "unit": "m",      "src": "live"},
+            "shear_06km": {"value": round(shear, 1),       "unit": "kts",    "src": "est"},
+            "srh_01km":   {"value": round(srh, 1),         "unit": "m2/s2",  "src": "est"},
+            "dewpoint":   {"value": round(final_dew_f, 1), "unit": "F",      "src": "live" if sta_dew else "live"},
+            "convergence":{"value": round(conv_val, 2),    "unit": "",       "src": conv_src},
+            "boundary":   {"value": "likely" if cape > 300 and cin > -150 else "unlikely", "unit": "", "src": "live"},
         }
     }
+    cache_set(key, result)
+    return result
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "cache_entries": len(_cache)}
